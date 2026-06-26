@@ -65,7 +65,7 @@ VaultFlow leverages the **QVAC Edge AI SDK** to process documents completely off
 
 1. **Clone the repository:**
    ```bash
-   git clone [https://github.com/Adityakk9031/vaultflow.git](https://github.com/Adityakk9031/VaultFlow)
+   git clone https://github.com/Adityakk9031/VaultFlow
    cd vaultflow
    ```
 
