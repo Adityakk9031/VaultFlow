@@ -13,9 +13,9 @@
 
 *(Add a link to your demonstration video below)*
 
-[![VaultFlow Demo](https://img.youtube.com/vi/YOUR_VIDEO_ID/maxresdefault.jpg)](https://www.youtube.com/watch?v=YOUR_VIDEO_ID "Watch the VaultFlow Demo")
 
-*(Tip: Replace `YOUR_VIDEO_ID` with your actual YouTube or Loom video ID.)*
+
+
 
 ---
 
@@ -65,7 +65,7 @@ VaultFlow leverages the **QVAC Edge AI SDK** to process documents completely off
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/your-org/vaultflow.git
+   git clone https://github.com/Adityakk9031/VaultFlow
    cd vaultflow
    ```
 
