@@ -51,8 +51,8 @@ export class QvacEngine {
         console.log('[QVAC] Loading LLM: LLAMA_3_2_1B_INST_Q4_0...')
         this.llmModelId = await this.sdk.loadModel({
           modelSrc: this.sdk.LLAMA_3_2_1B_INST_Q4_0,
-          modelType: 'llm',
-          onProgress: (p: number) => console.log(`[QVAC] LLM load: ${Math.round(p * 100)}%`),
+          modelType: 'llamacpp-completion',
+          onProgress: (p: any) => console.log(`[QVAC] LLM load: ${Math.round(p.percentage)}% (${(p.downloaded / 1e6).toFixed(1)} / ${(p.total / 1e6).toFixed(1)} MB)`),
         })
         console.log('[QVAC] LLM ready.')
       } catch (err) {
@@ -73,7 +73,11 @@ export class QvacEngine {
       console.log('[QVAC] Loading OCR model: OCR_0_6B_MULTIMODAL_Q4_K_M...')
       this.ocrModelId = await this.sdk.loadModel({
         modelSrc: this.sdk.OCR_0_6B_MULTIMODAL_Q4_K_M,
-        onProgress: (p: number) => console.log(`[QVAC] OCR load: ${Math.round(p * 100)}%`),
+        modelConfig: {
+          projectionModelSrc: this.sdk.MMPROJ_OCR_0_6B_MULTIMODAL_F16,
+          ctx_size: 4096,
+        },
+        onProgress: (p: any) => console.log(`[QVAC] OCR load: ${Math.round(p.percentage)}% (${(p.downloaded / 1e6).toFixed(1)} / ${(p.total / 1e6).toFixed(1)} MB)`),
       })
       console.log('[QVAC] OCR model ready.')
       return this.ocrModelId
@@ -88,13 +92,47 @@ export class QvacEngine {
     const modelId = await this.initOcr()
     if (!modelId || !this.sdk) throw new Error('OCR model unavailable')
 
-    const chunks: string[] = []
-    const stream = this.sdk.ocr({ modelId, image: imagePathOrBuffer })
-    for await (const chunk of stream) {
-      if (chunk?.text) chunks.push(chunk.text)
-      else if (typeof chunk === 'string') chunks.push(chunk)
+    let imagePath: string
+    let isTmp = false
+    if (Buffer.isBuffer(imagePathOrBuffer)) {
+      const { join } = await import('path')
+      const { tmpdir } = await import('os')
+      const { writeFile } = await import('fs/promises')
+      imagePath = join(tmpdir(), `qvac-ocr-${Date.now()}.jpg`)
+      await writeFile(imagePath, imagePathOrBuffer)
+      isTmp = true
+    } else {
+      imagePath = imagePathOrBuffer
     }
-    return chunks.join('').trim()
+
+    try {
+      const run = this.sdk.completion({
+        modelId,
+        history: [{
+          role: 'user',
+          content: 'Extract all the text from this receipt image accurately. Output only the raw text you see, nothing else.',
+          attachments: [{ path: imagePath }]
+        }],
+        stream: true,
+        generationParams: { temp: 0.0 }
+      })
+
+      const chunks: string[] = []
+      for await (const event of run.events) {
+        if (event.type === 'contentDelta') {
+          chunks.push(event.text)
+        }
+      }
+      return chunks.join('').trim()
+    } catch (err) {
+      console.error('[QVAC] OCR completion error:', err)
+      throw err
+    } finally {
+      if (isTmp) {
+        const { unlink } = await import('fs/promises')
+        unlink(imagePath).catch(() => {})
+      }
+    }
   }
 
   // runInference matches the spec: runInference(systemPrompt, userPrompt)
@@ -104,15 +142,19 @@ export class QvacEngine {
 
     if (this.sdk && this.llmModelId) {
       try {
-        const result = await this.sdk.completion({
+        const isCategorizer = systemPrompt.includes('Categorizer')
+        const run = this.sdk.completion({
           modelId: this.llmModelId,
           history: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt },
           ],
           stream: false,
+          generationParams: { temp: 0.0 },
+          ...(isCategorizer ? { responseFormat: { type: 'json_object' } } : {})
         })
-        return { text: result.text || '', latencyMs: Math.round(performance.now() - start) }
+        const text = await run.text
+        return { text: text || '', latencyMs: Math.round(performance.now() - start) }
       } catch (err) {
         console.error('[QVAC] Inference error, using fallback.', err)
       }
@@ -165,8 +207,8 @@ export class QvacEngine {
     
     let kwAmt = null;
     const primaryPats = [
-      /\b(?:receipt\s*total|grand\s*total|net\s*total|total\s*amount|total|sum|paid|charged)[:\s]*\$?\s*([\d,]+\.\d{2})\b/i,
-      /\b(?:receipt\s*total|grand\s*total|net\s*total|total\s*amount|total|sum|paid|charged)[:\s]*\$?\s*([\d,]+\.?\d*)/i,
+      /\b(?:receipt\s*total|grand\s*total|net\s*total|total\s*amount|total\s*due|(?<!sub\s|sub-|sub|gross\s|gross)total|sum|paid|charged)[:\s]*\$?\s*([\d,]+\.\d{2})\b/i,
+      /\b(?:receipt\s*total|grand\s*total|net\s*total|total\s*amount|total\s*due|(?<!sub\s|sub-|sub|gross\s|gross)total|sum|paid|charged)[:\s]*\$?\s*([\d,]+\.?\d*)/i,
       /\b(?:amount|amt)[:\s]*\$?\s*([\d,]+\.\d{2})\b/i,
       /\b(?:amount|amt)[:\s]*\$?\s*([\d,]+\.?\d*)/i,
       /\b(?:gross|subtotal)[:\s]*\$?\s*([\d,]+\.\d{2})\b/i,
@@ -288,7 +330,7 @@ export class QvacEngine {
 
     const categoryMap: [RegExp, string][] = [
       [/\bgrocery|\bsupermarket|food\s*market|\bwalmart|whole\s*foods|\bcostco|\bkroger|\bsafeway/i, 'Groceries'],
-      [/\brestaurant|\bdining|\bcafe|\bstarbucks|\bmcdonalds|\bdoordash|\bubereats|\bgrubhub|\bpizza|\bcheesecake|\bnightclub|\bbar\b|\blounge/i, 'Dining'],
+      [/\brestaurant|\bdining|\bcafe|\bstarbucks|\bmcdonalds|\bdoordash|\bubereats|\bgrubhub|\bpizza|\bcheesecake|\bnightclub|\bbar\b|\blounge|\bsushi|\bgrill|\bsteakhouse|\bdiner|\beatery|\bbistro|\bpub/i, 'Dining'],
       [/\btransport|\buber\b|\blyft|\bgas\s*station|\bfuel|\bshell\s*gas|\bexxon|\bchevron|\bparking|\btoll|\btransit/i, 'Transportation'],
       [/\bhotel|\bhilton|\bmarriott|\bairbnb|\btravel|\bflight|\bdelta|\bamerican\s*airlines|\bunited/i, 'Travel'],
       [/\bshopping|\bamazon|\btarget|\bmall|\bclothing|\bapparel|\bfashion|\belectronics|\bbest\s*buy|\bhome\s*depot|\bt-shirt|\bjeans?\b|\bshirt|\btrouser|\bdress|\bskirt|\bshoe|\bsneaker|\bboot|\bjacket|\bcoat|\bsuit\b|\bblouse|\bsweater|\bpdk\b|\barticle\b/i, 'Shopping'],
@@ -369,13 +411,26 @@ export class QvacEngine {
 
 // ── Agent System Prompts (from spec) ──────────────────────────────────────────
 
-const CATEGORIZER_PROMPT = `You are the VaultFlow Categorizer. Read the raw text of the parsed receipt. Extract the Merchant Name, Date (YYYY-MM-DD format), Total Amount, and core category. Return raw data formatted strictly as minified JSON matching this schema: {"merchant": string, "amount": number, "date": string, "category": string}. Do not include markdown codeblocks or wrap in backticks.`
+const CATEGORIZER_PROMPT = `You are the VaultFlow Categorizer. Read the raw text of the parsed receipt. Extract the Merchant Name, Date (YYYY-MM-DD format), Total Amount (this must be the final total due, including tax and tip—do NOT use the sub-total), and core category. Return raw data formatted strictly as minified JSON matching this schema: {"merchant": string, "amount": number, "date": string, "category": string}. Do not include markdown codeblocks or wrap in backticks.`
 
-const riskAssessorPrompt = (transactionJson: string) =>
-  `You are the VaultFlow Risk Assessor. Evaluate the incoming transaction data: ${transactionJson}. Contrast the total amount against our local hard threshold limit of $500 per single transaction. Explicitly return a single block formatted as [STATUS: APPROVED] or [STATUS: RISK_FLAGGED] followed by exactly one sentence justifying your risk metric.`
+const riskAssessorPrompt = (transactionJson: string, amount: number, isOverLimit: boolean) =>
+  `You are the VaultFlow Risk Assessor.
+Evaluate this transaction:
+${transactionJson}
+
+Math Check: The transaction amount of $${amount.toFixed(2)} is ${isOverLimit ? 'OVER' : 'UNDER'} the $500.00 budget limit.
+- Since it is ${isOverLimit ? 'OVER' : 'UNDER'}, you must output exactly: [STATUS: ${isOverLimit ? 'RISK_FLAGGED' : 'APPROVED'}] The transaction amount of $${amount.toFixed(2)} is ${isOverLimit ? 'over' : 'within'} the $500.00 budget limit.
+
+Do not write any other text. Output only this single status line.`
 
 const budgetAnalystPrompt = (transactionJson: string, riskStatus: string) =>
-  `You are the VaultFlow Senior Financial Analyst. Review this transaction: ${transactionJson} and its risk status: ${riskStatus}. Generate exactly one hyper-specific, actionable tip for optimizing personal spending based on this expense.`
+  `You are the VaultFlow Senior Financial Analyst.
+Analyze this transaction: ${transactionJson}
+Risk Status: ${riskStatus}
+
+Output exactly one short sentence of advice on how to optimize spending on this transaction.
+Template to fill: "You spent $[amount] at [merchant]. [One short sentence of advice]."
+Fill in the template using the actual amount and merchant from the transaction. Do not include any other text.`
 
 // ── Parsing helpers ────────────────────────────────────────────────────────────
 
@@ -426,7 +481,8 @@ export async function runAgentPipeline(
   const catJson = JSON.stringify(categorization)
   const riskLog: AgentLog = { agent: 'Risk Assessor', status: 'running', input: catJson, startedAt: Date.now() }
   onLog({ ...riskLog })
-  const riskResult = await engine.runInference(riskAssessorPrompt(catJson), catJson)
+  const isOverLimit = categorization.amount > 500
+  const riskResult = await engine.runInference(riskAssessorPrompt(catJson, categorization.amount, isOverLimit), catJson)
   const riskAssessment = parseRiskOutput(riskResult.text)
   riskLog.status = 'complete'; riskLog.output = riskResult.text; riskLog.completedAt = Date.now()
   onLog({ ...riskLog })
